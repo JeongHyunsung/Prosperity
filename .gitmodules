@@ -1,4 +1,4 @@
 [submodule "cacti"]
 	path = cacti
-	url = git@github.com:HewlettPackard/cacti.git
+	url = https://github.com/HewlettPackard/cacti.git
 	ignore = all
