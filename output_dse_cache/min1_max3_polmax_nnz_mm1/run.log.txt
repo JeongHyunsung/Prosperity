@@ -1,0 +1,90 @@
+conv2d_1_kernel3_fc
+original compute cycles:  2428122
+compute cycles:  1634767
+preprocess cycles:  676090
+total cycles:  1634779
+lif_1
+compute cycles:  131072
+latency:  2048
+total cycles:  131072
+conv2d_2_kernel3_fc
+original compute cycles:  769462
+compute cycles:  462375
+preprocess cycles:  219430
+total cycles:  462395
+lif_2
+compute cycles:  65536
+latency:  2048
+total cycles:  65536
+conv2d_3_kernel3_fc
+original compute cycles:  859443
+compute cycles:  528567
+preprocess cycles:  300434
+total cycles:  528587
+lif_3
+compute cycles:  65536
+latency:  2048
+total cycles:  65536
+conv2d_4_kernel3_fc
+original compute cycles:  1031692
+compute cycles:  468382
+preprocess cycles:  271756
+total cycles:  468402
+lif_4
+compute cycles:  32768
+latency:  2048
+total cycles:  32768
+conv2d_5_kernel3_fc
+original compute cycles:  686060
+compute cycles:  400678
+preprocess cycles:  258806
+total cycles:  400698
+lif_5
+compute cycles:  32768
+latency:  2048
+total cycles:  32768
+conv2d_6_kernel3_fc
+original compute cycles:  609902
+compute cycles:  345328
+preprocess cycles:  235114
+total cycles:  345348
+lif_6
+compute cycles:  32768
+latency:  2048
+total cycles:  32768
+conv2d_7_kernel3_fc
+original compute cycles:  1560964
+compute cycles:  857616
+preprocess cycles:  554256
+total cycles:  857636
+lif_7
+compute cycles:  65536
+latency:  2048
+total cycles:  65536
+conv2d_8_kernel3_fc
+original compute cycles:  2136112
+compute cycles:  1197604
+preprocess cycles:  838292
+total cycles:  1197624
+lif_8
+compute cycles:  65536
+latency:  2048
+total cycles:  65536
+Traceback (most recent call last):
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 1201, in <module>
+    stats = sim.sim()
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 95, in sim
+    stats = self.run_simulation()
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 116, in run_simulation
+    stats[operator.name] = self.run_conv2d(operator, spike_stored_in_buffer)
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 718, in run_conv2d
+    return self.run_fc(eq_fc, spike_stored_in_buffer)
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 529, in run_fc
+    return self.run_fc_global_cache(operator, spike_stored_in_buffer, weight_stored_in_buffer)
+  File "/home/hyunsung/SNN/Prosperity/simulator/simulator.py", line 437, in run_fc_global_cache
+    preprocess_act, prefix_array = global_cache.preprocess_tensor(cur_act)
+  File "/home/hyunsung/SNN/Prosperity/simulator/weight_dependent_cache.py", line 139, in preprocess_tensor
+    preprocessed_row, reused_prefix_index = self.lookup_rows(cur_row)
+  File "/home/hyunsung/SNN/Prosperity/simulator/weight_dependent_cache.py", line 96, in lookup_rows
+    is_equal = torch.all(equalities, dim=-1)
+KeyboardInterrupt

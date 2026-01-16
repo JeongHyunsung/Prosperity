@@ -14,6 +14,8 @@ from baselines import run_simulation_eyeriss, run_simulation_eyeriss_linear, run
 from energy import get_total_energy
 import prosparsity_engine
 
+from weight_dependent_cache import GlobalCache, ReplacementPolicy
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -168,6 +170,47 @@ class Simulator:
             total_stats.product_density = product_density
             print("bit density: ", bit_density)
             print("prosparsity density: ", product_density)
+            
+            # Plot sparsity comparison
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            
+            # Bar chart: Before vs After density
+            densities = [bit_density, product_density]
+            labels = ['Before\nProduct Sparsity', 'After\nProduct Sparsity']
+            colors = ['#ff7f0e', '#2ca02c']
+            axes[0].bar(labels, densities, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
+            axes[0].set_ylabel('Density', fontsize=12)
+            axes[0].set_title(f'Sparsity Comparison', fontsize=13, fontweight='bold')
+            axes[0].set_ylim(0, max(densities) * 1.2)
+            for i, v in enumerate(densities):
+                axes[0].text(i, v + 0.01, f'{v:.3f}', ha='center', fontsize=11, fontweight='bold')
+            
+            # Statistics summary
+            axes[1].axis('off')
+            summary_text = f"""
+Model: {self.benchmark_name}
+
+Before Product Sparsity:
+  • Total NNZ: {sum(ori_nnzs):,}
+  • Density: {bit_density:.3%}
+  
+After Product Sparsity:
+  • Total NNZ: {sum(processed_nnzs):,}
+  • Density: {product_density:.3%}
+  
+Improvement:
+  • NNZ Reduction: {sum(ori_nnzs) - sum(processed_nnzs):,} ({100*(1-product_density/bit_density):.1f}%)
+  • Sparsity Gain: {(bit_density - product_density):.3%}
+            """
+            axes[1].text(0.1, 0.5, summary_text, fontsize=11, verticalalignment='center',
+                        family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.accelerator.__dict__.get('output_dir', '../output'), 
+                                     f'sparsity_{self.benchmark_name}.png'), dpi=100, bbox_inches='tight')
+            print(f"\n✓ Sparsity graph saved!")
+            plt.close()
             if self.test_rank_two:
                 # ops_sparsity = sum(ops_nnzs) / sum(total_elements)
                 # rank_two_sparsity = sum(rank_two_nnzs) / sum(total_elements)
@@ -287,8 +330,7 @@ class Simulator:
 
         return stats
 
-
-    def run_fc(self, operator: FC, spike_stored_in_buffer=False, weight_stored_in_buffer=False):
+    def run_fc_global_cache(self, operator: FC, spike_stored_in_buffer=False, weight_stored_in_buffer=False):
         stats = Stats()
         assert operator.activation_tensor.shape[-1] == operator.weight_tensor.shape[0]
         # only deal with batch size 1
@@ -300,6 +342,202 @@ class Simulator:
         # transpose time step and sequence length
         operator.activation_tensor.sparse_map = operator.activation_tensor.sparse_map.permute(1, 0, 2).contiguous()
 
+        input_shape = operator.activation_tensor.shape
+        input_shape = [np.prod(input_shape[:-1]), input_shape[-1]]
+        
+        input_tensor = operator.activation_tensor.sparse_map.reshape(input_shape)
+        M, K, N = input_shape[0], input_shape[1], operator.weight_tensor.shape[1]
+        tile_size_M = self.accelerator.SpMM_tile_size_M
+        tile_size_K = self.accelerator.SpMM_tile_size_K
+        tile_size_N = self.accelerator.adder_array_size
+        tile_num_M = ceil_a_by_b(M, tile_size_M)
+        tile_num_K = ceil_a_by_b(K, tile_size_K)
+        tile_num_N = ceil_a_by_b(N, tile_size_N)
+
+        act_tile_size = tile_size_M * tile_size_K * 1 # spike is one bit
+        wgt_tile_size = tile_size_K * tile_size_N * operator.weight_tensor.nbits
+
+        ## Same : Since input sram has no advantage in this method, no change
+        if M * K <= self.accelerator.sram_size['act']:
+            buffer_state_act = "store all"
+        elif act_tile_size * tile_num_K <= self.accelerator.sram_size['act']:
+            buffer_state_act = "store row"
+        elif act_tile_size <= self.accelerator.sram_size['act']:
+            buffer_state_act = "store single tile"
+        else:
+            raise Exception("single tile cannot fit in sram act buffer")
+        
+        ## Different : Since weight is reused for M/m times, we can take advantage of it
+        if K * N * operator.weight_tensor.nbits <= self.accelerator.sram_size['wgt']:
+            buffer_state_wgt = "store all"
+        elif wgt_tile_size * tile_num_K <= self.accelerator.sram_size['wgt']:
+            buffer_state_wgt = "store col"
+        elif wgt_tile_size <= self.accelerator.sram_size['wgt']:
+            buffer_state_wgt = "store single tile"
+        else:
+            raise Exception("single tile cannot fit in sram wgt buffer")
+
+        # 1. load activation and weight to sram
+        # 2. load activation and weight to local buffer
+        # 3. do preprocess to the activation
+        # 4. start computation
+        compute_cycles = 0
+        preprocess_cycles = 0
+        orginial_compute_cycles = 0
+
+        is_conv = operator.name.endswith('_fc')
+        kernel_size = extract_kernel_size(operator.name)
+
+        ## Different : N -> K -> M order
+        for n in range(tile_num_N):
+            for k in range(tile_num_K):
+                ## Different : Weight dependent global cache introduced
+                global_cache = GlobalCache(tile_size_N, tile_size_M*self.accelerator.m_multiple, tile_size_K, self.accelerator.min_th, self.accelerator.max_th, self.accelerator.cache_policy)
+                for m in range(tile_num_M):
+                    cur_tile_size_M = min(tile_size_M, M - m * tile_size_M)
+                    cur_tile_size_K = min(tile_size_K, K - k * tile_size_K)
+                    cur_tile_size_N = min(tile_size_N, N - n * tile_size_N)
+                    cur_act = input_tensor[m * tile_size_M: m * tile_size_M + cur_tile_size_M, k * tile_size_K: k * tile_size_K + cur_tile_size_K]
+
+                    ## Same : Since input sram has no advantage in this method, no change
+                    if not spike_stored_in_buffer:
+                        if buffer_state_act == "store single tile":
+                            if is_conv:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K // (kernel_size * kernel_size) # on chip img2col
+                            else:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K
+                            stats.writes['g_act'] += cur_tile_size_M * cur_tile_size_K
+                        elif buffer_state_act == "store row":
+                            if is_conv:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K // (kernel_size * kernel_size)
+                            else:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K
+                            stats.writes['g_act'] += cur_tile_size_M * cur_tile_size_K
+                        elif buffer_state_act == "store all" and n == 0:
+                            if is_conv:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K // (kernel_size * kernel_size)
+                            else:
+                                stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K
+                            stats.writes['g_act'] += cur_tile_size_M * cur_tile_size_K
+                    
+                    ## Different : Since weight is reused for M/m times, we can take advantage of it
+                    if not weight_stored_in_buffer:
+                        if buffer_state_wgt == "store single tile" and m == 0:
+                            stats.reads['dram'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+                            stats.writes['g_wgt'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+                        elif buffer_state_wgt == "store col" and m == 0:
+                            stats.reads['dram'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+                            stats.writes['g_wgt'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+                        elif buffer_state_wgt == "store all" and m == 0:
+                            stats.reads['dram'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+                            stats.writes['g_wgt'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+
+                    if self.accelerator.product_sparsity:
+                        ## Different : product sparsity should be obtained by global cache, which is alive within same n, k weight tile.
+                        preprocess_act, prefix_array = global_cache.preprocess_tensor(cur_act)
+
+                        prosparsity_cycles = get_prosparsity_cycles(cur_act) + cur_act.shape[0] // self.accelerator.num_popcnt
+                        stats.reads['g_act'] += cur_tile_size_M * cur_tile_size_K
+                        stats.reads['g_wgt'] += torch.sum(preprocess_act != 0).item() * cur_tile_size_N * operator.weight_tensor.nbits
+                        # find the row in preprocess_act that is all zero, if all zero originally, no cycles needed, if not, need one cycle
+                        nnz_each_row = torch.sum(preprocess_act != 0, dim=-1)
+                        nnz_each_row_ori = torch.sum(cur_act != 0, dim=-1)
+                        all_zero_row = nnz_each_row == 0
+                        all_zero_row_ori = nnz_each_row_ori == 0
+                        if self.accelerator.issue_type == 1:
+                            forest = construct_prosparsity_forest(prefix_array)
+                            depth = nx.dag_longest_path_length(forest)
+                            cur_issue_cycles = depth // 4 * cur_tile_size_M
+                        else:
+                            cur_issue_cycles = 0
+                        cur_compute_cycles = torch.sum(preprocess_act != 0).item() + torch.sum(all_zero_row).item() - torch.sum(all_zero_row_ori).item()
+                        compute_cycles += max(cur_issue_cycles, cur_compute_cycles)
+
+
+                        num_all_zero_row.append(torch.sum(all_zero_row_ori).item())
+                        num_EM_row.append(torch.sum(all_zero_row).item() - torch.sum(all_zero_row_ori).item())
+                        num_PM_row.append(torch.sum(prefix_array != -1).item() - torch.sum(all_zero_row).item() + torch.sum(all_zero_row_ori).item())
+                        num_other_row.append(cur_tile_size_M - torch.sum(prefix_array != -1).item() - torch.sum(all_zero_row_ori).item())
+
+                        preprocess_cycles += prosparsity_cycles
+                        orginial_compute_cycles += torch.sum(cur_act != 0).item()
+                        stats.num_ops += torch.sum(preprocess_act != 0).item() * cur_tile_size_N
+
+                        rank_one_prefix.append(torch.sum(prefix_array != -1).item())
+                    
+                    elif not self.accelerator.dense:
+                        compute_cycles += torch.sum(cur_act != 0).item()
+
+                        stats.reads['g_act'] += cur_tile_size_M * cur_tile_size_K
+                        stats.reads['g_wgt'] += torch.sum(cur_act != 0).item() * cur_tile_size_N * operator.weight_tensor.nbits
+
+                        stats.num_ops += torch.sum(cur_act != 0).item() * cur_tile_size_N
+                    
+                    elif self.accelerator.dense:
+                        compute_cycles += cur_tile_size_M * cur_tile_size_K
+
+                        stats.reads['g_act'] += cur_tile_size_M * cur_tile_size_K
+                        stats.reads['g_wgt'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
+
+
+                    # write results to partial sum buffer
+                    stats.reads['g_psum'] += cur_tile_size_M * cur_tile_size_N * operator.output_tensor.nbits
+                    stats.writes['g_psum'] += cur_tile_size_M * cur_tile_size_N * operator.output_tensor.nbits
+
+
+                    if self.accelerator.product_sparsity and self.track_sparsity_increment:
+                        ori_nnzs.append(torch.sum(cur_act != 0).item())
+                        processed_nnzs.append(torch.sum(preprocess_act != 0).item())
+                        ops_nnzs.append(torch.sum(preprocess_act != 0).item() + torch.sum(all_zero_row).item() - torch.sum(all_zero_row_ori).item())
+                        total_elements.append(cur_tile_size_M * cur_tile_size_K)
+
+
+                    if self.test_rank_two:
+                        rank_two_act, num_prefix = find_rank_two_product_sparsity(cur_act)
+                        rank_two_nnzs.append(torch.sum(rank_two_act != 0).item())
+
+                        rank_two_prefix.append(num_prefix)
+
+        init_mem_access = 0
+        if not weight_stored_in_buffer:
+            init_mem_access += min(tile_size_K, K) * min(tile_size_N, N) * operator.weight_tensor.nbits # read the first tile from dram to buffer
+        if not spike_stored_in_buffer:
+            init_mem_access += min(tile_size_K, K) * min(tile_size_M, M)
+
+        total_mem_access = stats.reads['dram'] + stats.writes['dram']
+        middle_mem_access = total_mem_access - init_mem_access
+        init_latency = init_mem_access // self.accelerator.mem_if_width
+        middle_latency = middle_mem_access // self.accelerator.mem_if_width
+        stats.compute_cycles = max(compute_cycles, preprocess_cycles)
+        stats.preprocess_stall_cycles = max(0, preprocess_cycles - compute_cycles)
+        stats.mem_stall_cycles = init_latency + max(0, middle_latency - stats.compute_cycles)
+        stats.total_cycles = stats.compute_cycles + stats.mem_stall_cycles
+
+
+        print(operator.name)
+        print("original compute cycles: ", orginial_compute_cycles)
+        print("compute cycles: ", compute_cycles)
+        print("preprocess cycles: ", preprocess_cycles)
+        print("total cycles: ", stats.total_cycles)
+
+        return stats
+
+    def run_fc(self, operator: FC, spike_stored_in_buffer=False, weight_stored_in_buffer=False):
+
+        # different : use global cache options 
+        if self.accelerator.use_global_cache:
+            return self.run_fc_global_cache(operator, spike_stored_in_buffer, weight_stored_in_buffer)
+
+        stats = Stats()
+        assert operator.activation_tensor.shape[-1] == operator.weight_tensor.shape[0]
+        # only deal with batch size 1
+        assert operator.time_steps * operator.sequence_length * operator.input_dim == operator.activation_tensor.sparse_map.numel()
+        # reshape activation tensor
+        # to device
+        operator.activation_tensor.sparse_map = operator.activation_tensor.sparse_map
+        operator.activation_tensor.sparse_map = operator.activation_tensor.sparse_map.reshape(operator.time_steps, operator.sequence_length, operator.input_dim)
+        # transpose time step and sequence length
+        operator.activation_tensor.sparse_map = operator.activation_tensor.sparse_map.permute(1, 0, 2).contiguous()
 
         input_shape = operator.activation_tensor.shape
         input_shape = [np.prod(input_shape[:-1]), input_shape[-1]]
@@ -373,6 +611,7 @@ class Simulator:
                             else:
                                 stats.reads['dram'] += cur_tile_size_M * cur_tile_size_K
                             stats.writes['g_act'] += cur_tile_size_M * cur_tile_size_K
+                    
                     if not weight_stored_in_buffer:
                         if buffer_state_wgt == "store single tile":
                             stats.reads['dram'] += cur_tile_size_K * cur_tile_size_N * operator.weight_tensor.nbits
@@ -386,6 +625,7 @@ class Simulator:
 
                     if self.accelerator.product_sparsity:
                         preprocess_act, prefix_array = find_product_sparsity(cur_act)
+
                         prosparsity_cycles = get_prosparsity_cycles(cur_act) + cur_act.shape[0] // self.accelerator.num_popcnt
                         stats.reads['g_act'] += cur_tile_size_M * cur_tile_size_K
                         stats.reads['g_wgt'] += torch.sum(preprocess_act != 0).item() * cur_tile_size_N * operator.weight_tensor.nbits
@@ -844,6 +1084,13 @@ if __name__ == '__main__':
     parser.add_argument('--sparse_analysis_mode', action='store_true', default=False, help='analyze the ProSparity and BitSparsity in extra models')
     parser.add_argument('--issue_type', type=int, default=2, help='Prosperity issue type (1 or 2)')
 
+    ## Different : Global Cache Settings
+    parser.add_argument('--use_global_cache', action='store_true', default=False, help='use weight-dependent global cache')
+    parser.add_argument('--cache_policy', type=str, default='max_nnz', help='cache replacement policy (max_nnz, lru, fifo, random)')
+    parser.add_argument('--min_th', type=int, default=1, help='minimum threshold for cache')
+    parser.add_argument('--max_th', type=int, default=5, help='maximum threshold for cache')
+    parser.add_argument('--m_multiple', type=int, default=1, help='multiplier for cache size repect to m')
+
     args = parser.parse_args()
 
 
@@ -857,7 +1104,15 @@ if __name__ == '__main__':
                               product_sparsity=not args.bit_sparsity,
                               issue_type=args.issue_type,
                               dense=args.dense,
+
+                              ## Different : Global Cache Settings
+                              use_global_cache=args.use_global_cache,
+                              cache_policy=args.cache_policy,
+                              min_th=args.min_th,
+                              max_th=args.max_th,
+                              m_multiple=args.m_multiple,
                               )
+    accelerator.output_dir = args.output_dir
     
     ST_model_list = [
                      'spikformer_cifar10', 'spikformer_cifar10dvs', 'spikformer_cifar100', 
@@ -871,9 +1126,9 @@ if __name__ == '__main__':
                        ]
     stats_list = []
 
-    run_ST = True
-    run_SCNN = True
-    run_single_model = False
+    run_ST = False
+    run_SCNN = False
+    run_single_model = True
     model_list = [] # test set
 
     if run_SCNN:
@@ -881,7 +1136,7 @@ if __name__ == '__main__':
     if run_ST:
         model_list.extend(ST_model_list)
     if run_single_model:
-        model_list = ['spikformer_cifar100',]
+        model_list = ['vgg16_cifar10']  
 
     if args.sparse_analysis_mode:
         model_list = ['vgg16_cifar10', 'vgg16_cifar100', 
